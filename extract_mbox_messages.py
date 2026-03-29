@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import argparse
-import os
+import csv
 import re
 import sys
 from dataclasses import dataclass
@@ -40,6 +40,12 @@ class Stats:
     skipped_date: int = 0
     skipped_time: int = 0
     skipped_parse: int = 0
+
+
+@dataclass(frozen=True)
+class AddressInfo:
+    name: str
+    address: str
 
 
 class ProgressReporter:
@@ -173,21 +179,22 @@ def message_in_ranges(message_dt: datetime, ranges: Iterable[TimeRange]) -> bool
     return any(time_range.contains(minute_of_day) for time_range in ranges)
 
 
-def extract_sender_address(message) -> str | None:
-    addresses = getaddresses(message.get_all("from", []))
+def extract_first_address(message, header_name: str) -> AddressInfo | None:
+    addresses = getaddresses(message.get_all(header_name, []))
     if not addresses:
         return None
-    address = addresses[0][1].strip()
-    return address.lower() or None
+    display_name, address = addresses[0]
+    normalized_address = address.strip()
+    if not normalized_address:
+        return None
+    return AddressInfo(name=display_name.strip(), address=normalized_address)
 
 
-def first_recipient_slug(message) -> str:
-    addresses = getaddresses(message.get_all("to", []))
-    if not addresses:
+def recipient_slug(recipient: AddressInfo | None) -> str:
+    if recipient is None:
         return "unknown-recipient"
 
-    display_name, address = addresses[0]
-    base = display_name.strip() or address.split("@", 1)[0].strip() or "unknown-recipient"
+    base = recipient.name or recipient.address.split("@", 1)[0].strip() or "unknown-recipient"
     return slugify(base)
 
 
@@ -232,16 +239,51 @@ def parse_message(raw_bytes: bytes, encoding_errors: str):
     return message
 
 
+def build_summary_row(
+    message_dt: datetime,
+    sender: AddressInfo | None,
+    recipient: AddressInfo | None,
+    relative_file_path: Path,
+) -> dict[str, str]:
+    return {
+        "type": "email",
+        "timestamp": message_dt.isoformat(),
+        "From address": sender.address if sender else "",
+        "from name": sender.name if sender else "",
+        "To address": recipient.address if recipient else "",
+        "To name": recipient.name if recipient else "",
+        "file": relative_file_path.as_posix(),
+    }
+
+
+def write_summary_csv(output_dir: Path, summary_rows: list[dict[str, str]]) -> None:
+    summary_path = output_dir / "summary.csv"
+    fieldnames = [
+        "type",
+        "timestamp",
+        "From address",
+        "from name",
+        "To address",
+        "To name",
+        "file",
+    ]
+    with summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(summary_rows)
+
+
 def process_message(
     raw_bytes: bytes,
     output_dir: Path,
+    email_dir: Path,
     from_address: str,
     time_ranges: list[TimeRange],
     encoding_errors: str,
     stats: Stats,
     reporter: ProgressReporter,
     verbose: bool,
-) -> None:
+) -> dict[str, str] | None:
     stats.scanned += 1
     try:
         message = parse_message(raw_bytes, encoding_errors)
@@ -249,25 +291,26 @@ def process_message(
         stats.skipped_parse += 1
         if verbose:
             reporter.print_message(f"Skipping message #{stats.scanned}: parse error: {exc}")
-        return
+        return None
 
     stats.parsed += 1
 
-    sender_address = extract_sender_address(message)
+    sender = extract_first_address(message, "from")
+    sender_address = sender.address.lower() if sender else None
     if sender_address != from_address:
         stats.skipped_sender += 1
         if verbose:
             reporter.print_message(
                 f"Skipping message #{stats.scanned}: sender '{sender_address or '<missing>'}' does not match."
             )
-        return
+        return None
 
     message_dt = parse_message_date(message)
     if message_dt is None:
         stats.skipped_date += 1
         if verbose:
             reporter.print_message(f"Skipping message #{stats.scanned}: missing or invalid Date header.")
-        return
+        return None
 
     if not message_in_ranges(message_dt, time_ranges):
         stats.skipped_time += 1
@@ -275,14 +318,16 @@ def process_message(
             reporter.print_message(
                 f"Skipping message #{stats.scanned}: time {message_dt.strftime('%H:%M:%S')} outside allowed ranges."
             )
-        return
+        return None
 
-    recipient_slug = first_recipient_slug(message)
-    output_path = build_output_path(output_dir, message_dt, recipient_slug)
+    recipient = extract_first_address(message, "to")
+    output_path = build_output_path(email_dir, message_dt, recipient_slug(recipient))
     output_path.write_bytes(raw_bytes)
+    relative_output_path = output_path.relative_to(output_dir)
     stats.extracted += 1
     if verbose:
-        reporter.print_message(f"Wrote {output_path.name}")
+        reporter.print_message(f"Wrote {relative_output_path.as_posix()}")
+    return build_summary_row(message_dt, sender, recipient, relative_output_path)
 
 
 def iterate_mbox_messages(mbox_path: Path) -> Iterable[tuple[bytes, int]]:
@@ -328,6 +373,8 @@ def main() -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    email_dir = output_dir / "email"
+    email_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         time_ranges = parse_time_ranges(args.time_ranges)
@@ -336,15 +383,17 @@ def main() -> int:
         return 1
 
     stats = Stats()
+    summary_rows: list[dict[str, str]] = []
     total_bytes = mbox_path.stat().st_size
     reporter = ProgressReporter(total_bytes=total_bytes, enabled=not args.no_progress)
     normalized_sender = args.from_address.strip().lower()
 
     try:
         for raw_message, bytes_read in iterate_mbox_messages(mbox_path):
-            process_message(
+            summary_row = process_message(
                 raw_bytes=raw_message,
                 output_dir=output_dir,
+                email_dir=email_dir,
                 from_address=normalized_sender,
                 time_ranges=time_ranges,
                 encoding_errors=args.encoding_errors,
@@ -352,10 +401,13 @@ def main() -> int:
                 reporter=reporter,
                 verbose=args.verbose,
             )
+            if summary_row is not None:
+                summary_rows.append(summary_row)
             reporter.update(bytes_read=bytes_read, scanned=stats.scanned, extracted=stats.extracted)
     finally:
         reporter.finish()
 
+    write_summary_csv(output_dir, summary_rows)
     print_summary(stats)
     return 0
 
