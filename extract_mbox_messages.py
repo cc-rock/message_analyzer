@@ -8,7 +8,7 @@ import csv
 import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from email import policy
 from email.parser import BytesParser
 from email.utils import getaddresses, parsedate_to_datetime
@@ -115,6 +115,16 @@ def parse_args() -> argparse.Namespace:
         help="Comma-separated ranges like 07:00-13:00,15:00-18:00,21:00-23:30.",
     )
     parser.add_argument(
+        "--start-date",
+        required=True,
+        help="Inclusive start date in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--end-date",
+        required=True,
+        help="Inclusive end date in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="Print detailed skip/write information while processing.",
@@ -172,6 +182,13 @@ def parse_time_ranges(value: str) -> list[TimeRange]:
         raise ValueError("At least one time range is required.")
 
     return ranges
+
+
+def parse_cli_date(value: str, label: str) -> date:
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"Invalid {label} '{value}'. Expected YYYY-MM-DD.") from exc
 
 
 def message_in_ranges(message_dt: datetime, ranges: Iterable[TimeRange]) -> bool:
@@ -278,6 +295,8 @@ def process_message(
     output_dir: Path,
     email_dir: Path,
     from_address: str,
+    start_date: date,
+    end_date: date,
     time_ranges: list[TimeRange],
     encoding_errors: str,
     stats: Stats,
@@ -310,6 +329,15 @@ def process_message(
         stats.skipped_date += 1
         if verbose:
             reporter.print_message(f"Skipping message #{stats.scanned}: missing or invalid Date header.")
+        return None
+
+    message_date = message_dt.date()
+    if message_date < start_date or message_date > end_date:
+        stats.skipped_date += 1
+        if verbose:
+            reporter.print_message(
+                f"Skipping message #{stats.scanned}: date {message_date.isoformat()} outside allowed range."
+            )
         return None
 
     if not message_in_ranges(message_dt, time_ranges):
@@ -378,8 +406,14 @@ def main() -> int:
 
     try:
         time_ranges = parse_time_ranges(args.time_ranges)
+        start_date = parse_cli_date(args.start_date, "start date")
+        end_date = parse_cli_date(args.end_date, "end date")
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
+        return 1
+
+    if start_date > end_date:
+        print("Start date must be less than or equal to end date.", file=sys.stderr)
         return 1
 
     stats = Stats()
@@ -395,6 +429,8 @@ def main() -> int:
                 output_dir=output_dir,
                 email_dir=email_dir,
                 from_address=normalized_sender,
+                start_date=start_date,
+                end_date=end_date,
                 time_ranges=time_ranges,
                 encoding_errors=args.encoding_errors,
                 stats=stats,
