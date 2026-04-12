@@ -338,8 +338,8 @@ def compute_working_start(
     if non_working_day:
         return format_time_or_empty(first_message.timestamp if first_message else None)
 
-    threshold = time(10, 0, 0)
-    if first_message is None or first_message.timestamp.time() >= threshold:
+    threshold = datetime.combine(day_date, time(10, 0, 0))
+    if first_message is None or first_message.timestamp >= threshold:
         return "10:00:00"
     return first_message.timestamp.strftime("%H:%M:%S")
 
