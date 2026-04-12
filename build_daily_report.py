@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import holidays
 import shutil
 import sys
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ import re
 CHAT_ENTRY_RE = re.compile(
     r"^\[(\d{2}/\d{2}/\d{2}), (\d{2}:\d{2}:\d{2})\] ([^:]+):\s?(.*)$"
 )
+FRENCH_HOLIDAYS = holidays.FR()
 
 
 @dataclass(frozen=True)
@@ -259,14 +261,32 @@ def format_time_or_empty(value: datetime | None) -> str:
     return value.strftime("%H:%M:%S")
 
 
-def compute_working_start(first_message: SentMessage | None) -> str:
+def is_non_working_day(day_date: date) -> bool:
+    return day_date.weekday() >= 5 or day_date in FRENCH_HOLIDAYS
+
+
+def compute_working_start(
+    day_date: date,
+    first_message: SentMessage | None,
+    non_working_day: bool,
+) -> str:
+    if non_working_day:
+        return format_time_or_empty(first_message.timestamp if first_message else None)
+
     threshold = time(10, 0, 0)
     if first_message is None or first_message.timestamp.time() >= threshold:
         return "10:00:00"
     return first_message.timestamp.strftime("%H:%M:%S")
 
 
-def compute_working_end(day_date: date, last_message: SentMessage | None) -> str:
+def compute_working_end(
+    day_date: date,
+    last_message: SentMessage | None,
+    non_working_day: bool,
+) -> str:
+    if non_working_day:
+        return format_time_or_empty(last_message.timestamp if last_message else None)
+
     threshold = datetime.combine(day_date, time(19, 0, 0))
     if last_message is None or last_message.timestamp <= threshold:
         return "19:00:00"
@@ -282,6 +302,7 @@ def has_lunch_message(messages: list[SentMessage]) -> bool:
 def build_day_summary_row(day_date: date, messages: list[SentMessage]) -> dict[str, str]:
     first_message = messages[0] if messages else None
     last_message = messages[-1] if messages else None
+    non_working_day = is_non_working_day(day_date)
     return {
         "date": day_date.isoformat(),
         "first message time": format_time_or_empty(first_message.timestamp if first_message else None),
@@ -291,8 +312,8 @@ def build_day_summary_row(day_date: date, messages: list[SentMessage]) -> dict[s
         "last message recipent name": last_message.recipient_name if last_message else "",
         "last message recipient address": last_message.recipient_address if last_message else "",
         "messages in lunch time": "YES" if has_lunch_message(messages) else "NO",
-        "start working time": compute_working_start(first_message),
-        "end working time": compute_working_end(day_date, last_message),
+        "start working time": compute_working_start(day_date, first_message, non_working_day),
+        "end working time": compute_working_end(day_date, last_message, non_working_day),
     }
 
 
