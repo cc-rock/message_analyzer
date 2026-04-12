@@ -18,6 +18,15 @@ CHAT_ENTRY_RE = re.compile(
     r"^\[(\d{2}/\d{2}/\d{2}), (\d{2}:\d{2}:\d{2})\] ([^:]+):\s?(.*)$"
 )
 FRENCH_HOLIDAYS = holidays.FR()
+SUMMARY_FIELDNAMES = [
+    "type",
+    "timestamp",
+    "From address",
+    "from name",
+    "To address",
+    "To name",
+    "file",
+]
 
 
 @dataclass(frozen=True)
@@ -27,6 +36,7 @@ class SentMessage:
     recipient_name: str
     recipient_address: str
     file_path: Path
+    summary_row: dict[str, str]
 
 
 @dataclass(frozen=True)
@@ -34,6 +44,42 @@ class ChatEntry:
     message_dt: datetime
     sender_name: str
     raw_text: str
+
+
+class ProgressReporter:
+    def __init__(self, total_days: int, enabled: bool) -> None:
+        self.total_days = max(total_days, 1)
+        self.enabled = enabled
+        self.is_tty = enabled and sys.stdout.isatty()
+        self.last_render = ""
+        self.last_plain_percent = -1
+
+    def update(self, processed_days: int) -> None:
+        if not self.enabled:
+            return
+
+        percent = min(100.0, (processed_days / self.total_days) * 100.0)
+        line = f"{percent:6.2f}% | processed {processed_days}/{self.total_days} days"
+
+        if self.is_tty:
+            padding = ""
+            if len(self.last_render) > len(line):
+                padding = " " * (len(self.last_render) - len(line))
+            sys.stdout.write(f"\r{line}{padding}")
+            sys.stdout.flush()
+            self.last_render = line
+            return
+
+        rounded = int(percent)
+        if rounded != self.last_plain_percent:
+            print(line, flush=True)
+            self.last_plain_percent = rounded
+
+    def finish(self) -> None:
+        if self.enabled and self.is_tty and self.last_render:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self.last_render = ""
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +110,11 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         required=True,
         help="Directory where the daily report artifacts are written.",
+    )
+    parser.add_argument(
+        "--no-progress",
+        action="store_true",
+        help="Disable progress reporting.",
     )
     return parser.parse_args()
 
@@ -145,6 +196,7 @@ def read_summary(summary_path: Path, expected_type: str) -> list[SentMessage]:
                     recipient_name=(row.get("To name") or "").strip(),
                     recipient_address=(row.get("To address") or "").strip(),
                     file_path=file_path,
+                    summary_row={field: row.get(field, "") for field in SUMMARY_FIELDNAMES},
                 )
             )
 
@@ -261,8 +313,21 @@ def format_time_or_empty(value: datetime | None) -> str:
     return value.strftime("%H:%M:%S")
 
 
-def is_non_working_day(day_date: date) -> bool:
-    return day_date.weekday() >= 5 or day_date in FRENCH_HOLIDAYS
+def classify_day_type(day_date: date) -> str:
+    holiday_name = FRENCH_HOLIDAYS.get(day_date)
+    if holiday_name:
+        holiday_label = str(holiday_name).strip()
+        if holiday_label:
+            return f"public holiday: {holiday_label}"
+        return "public holiday"
+
+    if day_date in FRENCH_HOLIDAYS:
+        return "public holiday"
+
+    if day_date.weekday() >= 5:
+        return "weekend"
+
+    return "working"
 
 
 def compute_working_start(
@@ -302,9 +367,11 @@ def has_lunch_message(messages: list[SentMessage]) -> bool:
 def build_day_summary_row(day_date: date, messages: list[SentMessage]) -> dict[str, str]:
     first_message = messages[0] if messages else None
     last_message = messages[-1] if messages else None
-    non_working_day = is_non_working_day(day_date)
+    day_type = classify_day_type(day_date)
+    non_working_day = day_type != "working"
     return {
         "date": day_date.isoformat(),
+        "day type": day_type,
         "first message time": format_time_or_empty(first_message.timestamp if first_message else None),
         "first message recipent name": first_message.recipient_name if first_message else "",
         "first message recipient address": first_message.recipient_address if first_message else "",
@@ -321,6 +388,7 @@ def write_day_summary(output_dir: Path, rows: list[dict[str, str]]) -> None:
     summary_path = output_dir / "by_day.csv"
     fieldnames = [
         "date",
+        "day type",
         "first message time",
         "first message recipent name",
         "first message recipient address",
@@ -333,6 +401,25 @@ def write_day_summary(output_dir: Path, rows: list[dict[str, str]]) -> None:
     ]
     with summary_path.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_day_message_summary(day_dir: Path, messages: list[SentMessage]) -> None:
+    summary_path = day_dir / "day_summary.csv"
+    rows = [
+        message.summary_row
+        for message in sorted(
+            messages,
+            key=lambda message: (
+                message.timestamp,
+                message.source,
+                message.summary_row.get("file", ""),
+            ),
+        )
+    ]
+    with summary_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=SUMMARY_FIELDNAMES)
         writer.writeheader()
         writer.writerows(rows)
 
@@ -377,23 +464,37 @@ def main() -> int:
 
     boundaries = build_boundaries(start_date, end_date, sent_messages)
     assigned_messages = assign_messages_to_days(start_date, end_date, sent_messages, boundaries)
+    total_days = (end_date - start_date).days + 1
+    reporter = ProgressReporter(total_days=total_days, enabled=not args.no_progress)
 
     summary_rows: list[dict[str, str]] = []
-    for current_date in iter_dates(start_date, end_date):
-        day_messages = assigned_messages[current_date]
-        summary_rows.append(build_day_summary_row(current_date, day_messages))
+    processed_days = 0
+    try:
+        for current_date in iter_dates(start_date, end_date):
+            day_messages = assigned_messages[current_date]
+            summary_rows.append(build_day_summary_row(current_date, day_messages))
 
-        if not day_messages:
-            continue
+            if day_messages:
+                day_dir = (
+                    output_dir
+                    / current_date.strftime("%Y")
+                    / current_date.strftime("%m")
+                    / current_date.strftime("%d")
+                )
+                email_day_messages = [message for message in day_messages if message.source == "email"]
+                whatsapp_day_messages = [message for message in day_messages if message.source == "whatsapp"]
 
-        day_dir = output_dir / current_date.strftime("%Y") / current_date.strftime("%m") / current_date.strftime("%d")
-        email_day_messages = [message for message in day_messages if message.source == "email"]
-        whatsapp_day_messages = [message for message in day_messages if message.source == "whatsapp"]
+                if email_day_messages:
+                    export_email_messages(day_dir, email_day_messages)
+                if whatsapp_day_messages:
+                    export_whatsapp_messages(day_dir, whatsapp_day_messages)
 
-        if email_day_messages:
-            export_email_messages(day_dir, email_day_messages)
-        if whatsapp_day_messages:
-            export_whatsapp_messages(day_dir, whatsapp_day_messages)
+                write_day_message_summary(day_dir, day_messages)
+
+            processed_days += 1
+            reporter.update(processed_days=processed_days)
+    finally:
+        reporter.finish()
 
     write_day_summary(output_dir, summary_rows)
     return 0
