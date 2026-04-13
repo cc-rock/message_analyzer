@@ -256,7 +256,7 @@ def parse_message_date(message) -> datetime | None:
         parsed = parsedate_to_datetime(raw_date)
     except (TypeError, ValueError, IndexError, OverflowError):
         return None
-    if parsed is None or parsed.tzinfo is None:
+    if parsed is None:
         return None
     return parsed
 
