@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract filtered messages from WhatsApp iOS chat export zip files."""
+"""Extract WhatsApp chats from iOS zip files with optional full-chat export."""
 
 from __future__ import annotations
 
@@ -106,7 +106,11 @@ class ProgressReporter:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Extract filtered messages from WhatsApp iOS chat export zip files."
+        description=(
+            "Export filtered WhatsApp iOS chat files by default, or full chats with "
+            "--export-full-chats, while keeping filtered sent-message rows in "
+            "wa_summary.csv."
+        )
     )
     parser.add_argument(
         "--input-dir",
@@ -116,7 +120,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir",
         required=True,
-        help="Directory where filtered WhatsApp chat files are written.",
+        help="Directory where WhatsApp chat files and wa_summary.csv are written.",
+    )
+    parser.add_argument(
+        "--export-full-chats",
+        action="store_true",
+        help=(
+            "Write the entire _chat.txt content for each archive. When omitted, exported "
+            "chat files keep the previous filtered behavior."
+        ),
     )
     parser.add_argument(
         "--from-name",
@@ -443,8 +455,10 @@ def main() -> int:
                         )
                     continue
 
-                exported_chunks.append(entry.raw_text)
-                stats.extracted += 1
+                if not args.export_full_chats:
+                    exported_chunks.append(entry.raw_text)
+                    stats.extracted += 1
+
                 if entry.sender_name.strip() == from_name:
                     summary_rows.append(
                         build_summary_row(
@@ -454,6 +468,10 @@ def main() -> int:
                             relative_file_path=relative_output_path,
                         )
                     )
+
+            if args.export_full_chats:
+                exported_chunks = [entry.raw_text for entry in entries]
+                stats.extracted += len(entries)
 
             output_path.write_text("".join(exported_chunks), encoding="utf-8", newline="")
             stats.chats_written += 1
