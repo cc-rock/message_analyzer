@@ -424,6 +424,10 @@ def write_day_message_summary(day_dir: Path, messages: list[SentMessage]) -> Non
         writer.writerows(rows)
 
 
+def build_day_output_dir(output_dir: Path, day_date: date) -> Path:
+    return output_dir / "days" / day_date.isoformat()
+
+
 def main() -> int:
     args = parse_args()
 
@@ -475,12 +479,7 @@ def main() -> int:
             summary_rows.append(build_day_summary_row(current_date, day_messages))
 
             if day_messages:
-                day_dir = (
-                    output_dir
-                    / current_date.strftime("%Y")
-                    / current_date.strftime("%m")
-                    / current_date.strftime("%d")
-                )
+                day_dir = build_day_output_dir(output_dir, current_date)
                 email_day_messages = [message for message in day_messages if message.source == "email"]
                 whatsapp_day_messages = [message for message in day_messages if message.source == "whatsapp"]
 
