@@ -22,17 +22,21 @@ else:
 
 REQUIRED_HEADERS = {
     "date",
+    "day type",
     "messages in lunch time",
     "start working time",
     "end working time",
 }
 DATE_CELL_RE = re.compile(r"^\s*(\d{1,2})/(\d{1,2})/(\d{4})\s*$")
 TIME_FORMAT = "%H:%M:%S"
+LUNCH_START_MINUTES = 12 * 60
+LUNCH_END_MINUTES = 14 * 60
 
 
 @dataclass(frozen=True)
 class DaySummary:
     day: date
+    day_type: str
     lunch_flag: str
     start_time: time | None
     end_time: time | None
@@ -155,6 +159,7 @@ def load_day_summaries(csv_path: Path) -> dict[date, DaySummary]:
 
                 summaries[day_value] = DaySummary(
                     day=day_value,
+                    day_type=(row["day type"] or "").strip().lower(),
                     lunch_flag=lunch_flag,
                     start_time=parse_optional_time(
                         row["start working time"],
@@ -171,6 +176,21 @@ def load_day_summaries(csv_path: Path) -> dict[date, DaySummary]:
             return summaries
     except OSError as exc:
         raise OSError(f"Failed to read input CSV '{csv_path}': {exc}") from exc
+
+
+def time_to_minutes(time_value: time) -> int:
+    return (time_value.hour * 60) + time_value.minute
+
+
+def interval_crosses_lunch(start_time: time, end_time: time) -> bool:
+    start_minutes = time_to_minutes(start_time)
+    end_minutes = time_to_minutes(end_time)
+    if end_minutes < start_minutes:
+        end_minutes += 24 * 60
+
+    return not (
+        end_minutes < LUNCH_START_MINUTES or start_minutes > LUNCH_END_MINUTES
+    )
 
 
 def time_to_excel_decimal(time_value: time, *, add_24_hours: bool = False) -> float:
@@ -210,6 +230,13 @@ def update_workbook(
         if summary is None:
             continue
 
+        if (
+            summary.start_time is not None
+            and summary.end_time is not None
+            and summary.start_time == summary.end_time
+        ):
+            continue
+
         wrote_start = False
         wrote_end = False
 
@@ -232,6 +259,14 @@ def update_workbook(
                 raise ValueError(
                     f"Invalid lunch flag '{summary.lunch_flag}' for CSV date {row_date.isoformat()}."
                 )
+            if (
+                summary.day_type != "working"
+                and summary.start_time is not None
+                and summary.end_time is not None
+                and not interval_crosses_lunch(summary.start_time, summary.end_time)
+            ):
+                continue
+
             sheet[f"{lunch_column}{row_index}"] = 1.0 if summary.lunch_flag == "NO" else 0.0
 
     try:
