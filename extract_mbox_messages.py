@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import holidays
 import re
 import sys
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from typing import Iterable
 
 
 SLUG_RE = re.compile(r"[^A-Za-z0-9]+")
+FRENCH_HOLIDAYS = holidays.FR()
 
 
 @dataclass(frozen=True)
@@ -112,7 +114,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--time-ranges",
         required=True,
-        help="Comma-separated ranges like 07:00-13:00,15:00-18:00,21:00-23:30.",
+        help=(
+            "Comma-separated ranges like 07:00-13:00,15:00-18:00,21:00-23:30. "
+            "Ignored on non-working days unless --use-time-ranges-for-non-working-days is set."
+        ),
     )
     parser.add_argument(
         "--start-date",
@@ -123,6 +128,14 @@ def parse_args() -> argparse.Namespace:
         "--end-date",
         required=True,
         help="Inclusive end date in YYYY-MM-DD format.",
+    )
+    parser.add_argument(
+        "--use-time-ranges-for-non-working-days",
+        action="store_true",
+        help=(
+            "Apply time-range filtering on French public holidays and weekends instead of "
+            "exporting all sent messages for those dates."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -194,6 +207,10 @@ def parse_cli_date(value: str, label: str) -> date:
 def message_in_ranges(message_dt: datetime, ranges: Iterable[TimeRange]) -> bool:
     minute_of_day = message_dt.hour * 60 + message_dt.minute
     return any(time_range.contains(minute_of_day) for time_range in ranges)
+
+
+def is_non_working_day(day_date: date) -> bool:
+    return day_date in FRENCH_HOLIDAYS or day_date.weekday() >= 5
 
 
 def extract_first_address(message, header_name: str) -> AddressInfo | None:
@@ -298,6 +315,7 @@ def process_message(
     start_date: date,
     end_date: date,
     time_ranges: list[TimeRange],
+    use_time_ranges_for_non_working_days: bool,
     encoding_errors: str,
     stats: Stats,
     reporter: ProgressReporter,
@@ -340,7 +358,8 @@ def process_message(
             )
         return None
 
-    if not message_in_ranges(message_dt, time_ranges):
+    enforce_time_ranges = use_time_ranges_for_non_working_days or not is_non_working_day(message_date)
+    if enforce_time_ranges and not message_in_ranges(message_dt, time_ranges):
         stats.skipped_time += 1
         if verbose:
             reporter.print_message(
@@ -432,6 +451,7 @@ def main() -> int:
                 start_date=start_date,
                 end_date=end_date,
                 time_ranges=time_ranges,
+                use_time_ranges_for_non_working_days=args.use_time_ranges_for_non_working_days,
                 encoding_errors=args.encoding_errors,
                 stats=stats,
                 reporter=reporter,
