@@ -39,7 +39,8 @@ class Stats:
     parsed: int = 0
     extracted: int = 0
     skipped_sender: int = 0
-    skipped_date: int = 0
+    skipped_invalid_date: int = 0
+    skipped_date_range: int = 0
     skipped_time: int = 0
     skipped_parse: int = 0
 
@@ -104,7 +105,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--mbox", required=True, help="Path to the input .mbox file.")
     parser.add_argument(
-        "--output-dir", required=True, help="Directory where matching .eml files are written."
+        "--output-dir", help="Directory where matching .eml files are written."
     )
     parser.add_argument(
         "--from-address",
@@ -152,6 +153,18 @@ def parse_args() -> argparse.Namespace:
         default="replace",
         choices=("strict", "ignore", "replace"),
         help="How to decode malformed header bytes surfaced by the email parser.",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help=(
+            "Keep the existing filtering/parsing flow, but instead of exporting messages, "
+            "log the raw header section of messages whose Date header cannot be parsed."
+        ),
+    )
+    parser.add_argument(
+        "--log-file",
+        help="Path to the debug log file written by --debug.",
     )
     return parser.parse_args()
 
@@ -261,6 +274,24 @@ def parse_message_date(message) -> datetime | None:
     return parsed
 
 
+def extract_raw_headers(raw_bytes: bytes) -> bytes:
+    for separator in (b"\r\n\r\n", b"\n\n"):
+        index = raw_bytes.find(separator)
+        if index != -1:
+            return raw_bytes[:index]
+    return raw_bytes
+
+
+def append_debug_headers(log_path: Path, raw_bytes: bytes, encoding_errors: str) -> None:
+    header_text = extract_raw_headers(raw_bytes).decode("utf-8", errors=encoding_errors)
+    separator = "-" * 80
+    with log_path.open("a", encoding="utf-8") as handle:
+        handle.write(header_text)
+        if header_text and not header_text.endswith("\n"):
+            handle.write("\n")
+        handle.write(f"{separator}\n")
+
+
 def parse_message(raw_bytes: bytes, encoding_errors: str):
     parser_policy = policy.default.clone(utf8=True, raise_on_defect=False)
     parser = BytesParser(policy=parser_policy)
@@ -309,14 +340,16 @@ def write_summary_csv(output_dir: Path, summary_rows: list[dict[str, str]]) -> N
 
 def process_message(
     raw_bytes: bytes,
-    output_dir: Path,
-    email_dir: Path,
+    output_dir: Path | None,
+    email_dir: Path | None,
     from_address: str,
     start_date: date,
     end_date: date,
     time_ranges: list[TimeRange],
     use_time_ranges_for_non_working_days: bool,
     encoding_errors: str,
+    debug: bool,
+    log_path: Path | None,
     stats: Stats,
     reporter: ProgressReporter,
     verbose: bool,
@@ -344,14 +377,16 @@ def process_message(
 
     message_dt = parse_message_date(message)
     if message_dt is None:
-        stats.skipped_date += 1
+        stats.skipped_invalid_date += 1
+        if debug and log_path is not None:
+            append_debug_headers(log_path, raw_bytes, encoding_errors)
         if verbose:
             reporter.print_message(f"Skipping message #{stats.scanned}: missing or invalid Date header.")
         return None
 
     message_date = message_dt.date()
     if message_date < start_date or message_date > end_date:
-        stats.skipped_date += 1
+        stats.skipped_date_range += 1
         if verbose:
             reporter.print_message(
                 f"Skipping message #{stats.scanned}: date {message_date.isoformat()} outside allowed range."
@@ -367,6 +402,11 @@ def process_message(
             )
         return None
 
+    if debug:
+        return None
+
+    assert output_dir is not None
+    assert email_dir is not None
     recipient = extract_first_address(message, "to")
     output_path = build_output_path(email_dir, message_dt, recipient_slug(recipient))
     output_path.write_bytes(raw_bytes)
@@ -405,7 +445,8 @@ def print_summary(stats: Stats) -> None:
     print(f"  Messages parsed: {stats.parsed}")
     print(f"  Extracted: {stats.extracted}")
     print(f"  Skipped (sender mismatch): {stats.skipped_sender}")
-    print(f"  Skipped (date parse failure): {stats.skipped_date}")
+    print(f"  Skipped (date parse failure): {stats.skipped_invalid_date}")
+    print(f"  Skipped (date outside range): {stats.skipped_date_range}")
     print(f"  Skipped (time mismatch): {stats.skipped_time}")
     print(f"  Skipped (parse failure): {stats.skipped_parse}")
 
@@ -418,11 +459,6 @@ def main() -> int:
         print(f"Input mbox file not found: {mbox_path}", file=sys.stderr)
         return 1
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    email_dir = output_dir / "email"
-    email_dir.mkdir(parents=True, exist_ok=True)
-
     try:
         time_ranges = parse_time_ranges(args.time_ranges)
         start_date = parse_cli_date(args.start_date, "start date")
@@ -434,6 +470,25 @@ def main() -> int:
     if start_date > end_date:
         print("Start date must be less than or equal to end date.", file=sys.stderr)
         return 1
+
+    if args.debug:
+        if not args.log_file:
+            print("--log-file is required when --debug is set.", file=sys.stderr)
+            return 1
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text("", encoding="utf-8")
+        output_dir = None
+        email_dir = None
+    else:
+        if not args.output_dir:
+            print("--output-dir is required unless --debug is set.", file=sys.stderr)
+            return 1
+        output_dir = Path(args.output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        email_dir = output_dir / "email"
+        email_dir.mkdir(parents=True, exist_ok=True)
+        log_path = None
 
     stats = Stats()
     summary_rows: list[dict[str, str]] = []
@@ -453,6 +508,8 @@ def main() -> int:
                 time_ranges=time_ranges,
                 use_time_ranges_for_non_working_days=args.use_time_ranges_for_non_working_days,
                 encoding_errors=args.encoding_errors,
+                debug=args.debug,
+                log_path=log_path,
                 stats=stats,
                 reporter=reporter,
                 verbose=args.verbose,
@@ -463,7 +520,8 @@ def main() -> int:
     finally:
         reporter.finish()
 
-    write_summary_csv(output_dir, summary_rows)
+    if output_dir is not None:
+        write_summary_csv(output_dir, summary_rows)
     print_summary(stats)
     return 0
 
