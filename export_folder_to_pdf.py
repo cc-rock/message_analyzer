@@ -158,26 +158,16 @@ WHATSAPP_STYLES = """
     display: block;
   }
 
-  .day-header {
+  .section-header {
     background: var(--day-band);
     border: 1px solid #c5d9f3;
     border-radius: 999px;
     color: #194264;
-    font-size: 12px;
-    margin: 0 auto 14px;
-    padding: 7px 14px;
-    text-align: center;
-    width: fit-content;
-  }
-
-  .range-header {
-    background: var(--range-band);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    color: var(--muted);
     font-size: 11px;
     margin: 0 0 12px;
-    padding: 6px 10px;
+    padding: 6px 12px;
+    text-align: center;
+    width: fit-content;
   }
 
   .message-row {
@@ -250,7 +240,9 @@ CSV_STYLES = """
     padding: 6px 8px;
     text-align: left;
     vertical-align: top;
+    overflow-wrap: anywhere;
     word-break: break-word;
+    hyphens: auto;
   }
 
   th {
@@ -893,20 +885,18 @@ def render_whatsapp_html(
   </head>
   <body>
     <main class="page">
-      <div class="range-header">No parsable WhatsApp messages found in this file.</div>
+      <div class="section-header">No parsable WhatsApp messages found in this file.</div>
     </main>
   </body>
 </html>"""
 
     parts: list[str] = []
-    previous_day: date | None = None
     normalized_my_name = my_whatsapp_name.strip()
     for section in sections:
-        if section.day_date != previous_day:
-            parts.append(f'<div class="day-header">{html.escape(section.day_label)}</div>')
-            previous_day = section.day_date
+        header_text = section.day_label
         if section.range_label:
-            parts.append(f'<div class="range-header">{html.escape(section.range_label)}</div>')
+            header_text = f"{header_text} | {section.range_label}"
+        parts.append(f'<div class="section-header">{html.escape(header_text)}</div>')
 
         for entry in section.entries:
             role = "mine" if normalized_my_name and entry.sender_name == normalized_my_name else "other"

@@ -10,6 +10,7 @@ from export_folder_to_pdf import (
     normalize_csv_rows,
     parse_chat_entries,
     parse_time_ranges,
+    render_whatsapp_html,
 )
 
 
@@ -78,6 +79,19 @@ class WhatsAppGroupingTests(unittest.TestCase):
         sections = group_whatsapp_sections(entries, time_ranges, True)
 
         self.assertEqual([section.range_label for section in sections], ["07:00-13:00", "15:00-18:00"])
+
+    def test_rendered_whatsapp_headers_include_day_and_time_range_on_one_line(self) -> None:
+        chat_text = (
+            "[06/05/24, 08:15:00] Carlo: morning\n"
+            "[06/05/24, 16:30:00] Alice: afternoon\n"
+        )
+        entries = parse_chat_entries(chat_text)
+        time_ranges = parse_time_ranges("07:00-13:00,15:00-18:00")
+
+        html_text = render_whatsapp_html(entries, time_ranges, "Carlo", False)
+
+        self.assertIn("Monday 06 May 2024 | 07:00-13:00", html_text)
+        self.assertIn("Monday 06 May 2024 | 15:00-18:00", html_text)
 
 
 class NormalizeCsvRowsTests(unittest.TestCase):
