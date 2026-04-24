@@ -38,6 +38,7 @@ class Stats:
     scanned: int = 0
     parsed: int = 0
     extracted: int = 0
+    matched_but_not_written: int = 0
     skipped_sender: int = 0
     skipped_invalid_date: int = 0
     skipped_date_range: int = 0
@@ -403,6 +404,7 @@ def process_message(
         return None
 
     if debug:
+        stats.matched_but_not_written += 1
         return None
 
     assert output_dir is not None
@@ -444,6 +446,7 @@ def print_summary(stats: Stats) -> None:
     print(f"  Messages scanned: {stats.scanned}")
     print(f"  Messages parsed: {stats.parsed}")
     print(f"  Extracted: {stats.extracted}")
+    print(f"  Matched but not written (debug mode): {stats.matched_but_not_written}")
     print(f"  Skipped (sender mismatch): {stats.skipped_sender}")
     print(f"  Skipped (date parse failure): {stats.skipped_invalid_date}")
     print(f"  Skipped (date outside range): {stats.skipped_date_range}")

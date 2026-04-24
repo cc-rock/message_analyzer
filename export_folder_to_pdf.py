@@ -7,6 +7,7 @@ import argparse
 import base64
 import csv
 import html
+import io
 import mimetypes
 import sys
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ CHAT_ENTRY_RE = re.compile(
 FRENCH_HOLIDAYS = holidays.FR()
 SUPPORTED_EXTENSIONS = {".eml", ".txt", ".csv"}
 DEFAULT_TIME_RANGES = "00:00-23:59"
+TEXT_FALLBACK_ENCODINGS = ("utf-8", "utf-8-sig", "cp1252", "latin-1")
 
 BASE_STYLES = """
   :root {
@@ -864,6 +866,65 @@ def render_email_html(model: EmailRenderModel) -> str:
 </html>"""
 
 
+def strip_html_to_text(value: str) -> str:
+    text = re.sub(r"(?is)<(script|style)\b.*?>.*?</\1>", "", value)
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</p\s*>", "\n\n", text)
+    text = re.sub(r"(?i)</div\s*>", "\n", text)
+    text = re.sub(r"(?i)</li\s*>", "\n", text)
+    text = re.sub(r"(?is)<[^>]+>", "", text)
+    text = html.unescape(text)
+    lines = [line.rstrip() for line in text.splitlines()]
+    return "\n".join(lines).strip()
+
+
+def build_email_plaintext_fallback_html(source_path: Path) -> str:
+    with source_path.open("rb") as handle:
+        message = BytesParser(policy=policy.default).parse(handle)
+
+    body_content, is_html = pick_email_body(message)
+    body_text = strip_html_to_text(body_content) if is_html else body_content.strip()
+    attachments: list[str] = []
+    for part in message.walk():
+        if part.is_multipart():
+            continue
+        filename = part.get_filename()
+        if not filename:
+            continue
+        content_type = part.get_content_type()
+        content_disposition = (part.get_content_disposition() or "").lower()
+        content_id = part.get("Content-ID")
+        inline = content_disposition == "inline" or bool(content_id)
+        if not inline:
+            attachments.append(f"- {filename} ({content_type})")
+
+    subject = (message.get("subject") or "(No subject)").strip() or "(No subject)"
+    from_text = format_address_list(message, "from")
+    to_text = format_address_list(message, "to")
+    cc_text = format_address_list(message, "cc")
+    reply_to_text = format_address_list(message, "reply-to")
+    date_text = format_email_date(message)
+
+    meta_lines = [
+        f"From: {from_text}" if from_text else "",
+        f"To: {to_text}" if to_text else "",
+        f"Cc: {cc_text}" if cc_text else "",
+        f"Reply-To: {reply_to_text}" if reply_to_text else "",
+        f"Date: {date_text}" if date_text else "",
+    ]
+    attachment_block = ""
+    if attachments:
+        attachment_block = "\n\nAttachments:\n" + "\n".join(attachments)
+
+    content = (
+        "\n".join(line for line in meta_lines if line)
+        + "\n\n"
+        + (body_text or "(No readable body content)")
+        + attachment_block
+    ).strip()
+    return render_plaintext_fallback_html(subject, content)
+
+
 def render_whatsapp_html(
     entries: list[ChatEntry],
     time_ranges: list[TimeRange],
@@ -969,9 +1030,22 @@ def render_csv_html(rows: list[list[str]]) -> str:
 </html>"""
 
 
+def read_text_with_fallbacks(source_path: Path) -> str:
+    raw_bytes = source_path.read_bytes()
+    last_error: UnicodeDecodeError | None = None
+    for encoding in TEXT_FALLBACK_ENCODINGS:
+        try:
+            return raw_bytes.decode(encoding)
+        except UnicodeDecodeError as exc:
+            last_error = exc
+
+    assert last_error is not None
+    raise last_error
+
+
 def read_csv_rows(source_path: Path) -> list[list[str]]:
-    with source_path.open("r", encoding="utf-8", newline="") as handle:
-        return [row for row in csv.reader(handle)]
+    text = read_text_with_fallbacks(source_path)
+    return [row for row in csv.reader(io.StringIO(text, newline=""))]
 
 
 def render_plaintext_fallback_html(title: str, content: str) -> str:
@@ -1012,10 +1086,25 @@ def convert_file(
 ) -> None:
     suffix = source_path.suffix.lower()
     if suffix == ".eml":
-        model = build_email_model(source_path)
-        html_text = render_email_html(model)
+        try:
+            model = build_email_model(source_path)
+            html_text = render_email_html(model)
+            write_pdf_from_html(
+                html_text,
+                target_path,
+                base_url=source_path.parent.resolve().as_uri(),
+            )
+            return
+        except RecursionError:
+            fallback_html = build_email_plaintext_fallback_html(source_path)
+            write_pdf_from_html(
+                fallback_html,
+                target_path,
+                base_url=source_path.parent.resolve().as_uri(),
+            )
+            return
     elif suffix == ".txt":
-        text = source_path.read_text(encoding="utf-8")
+        text = read_text_with_fallbacks(source_path)
         entries = parse_chat_entries(text)
         if entries:
             html_text = render_whatsapp_html(
