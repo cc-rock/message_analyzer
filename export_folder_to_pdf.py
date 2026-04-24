@@ -358,6 +358,12 @@ class ConversionStats:
     failed: int = 0
 
 
+@dataclass(frozen=True)
+class TextDecodeResult:
+    text: str
+    encoding: str
+
+
 class ProgressReporter:
     def __init__(self, total_files: int, enabled: bool) -> None:
         self.total_files = max(total_files, 1)
@@ -483,6 +489,15 @@ def parse_args() -> argparse.Namespace:
         "--no-progress",
         action="store_true",
         help="Disable progress reporting.",
+    )
+    parser.add_argument(
+        "--debug-encodings",
+        action="store_true",
+        help="Print text/CSV decoder attempts and byte context for decode failures.",
+    )
+    parser.add_argument(
+        "--email-conversion-warning-file",
+        help="Append sanitized email conversion warnings to this log file.",
     )
     return parser.parse_args()
 
@@ -1030,21 +1045,45 @@ def render_csv_html(rows: list[list[str]]) -> str:
 </html>"""
 
 
-def read_text_with_fallbacks(source_path: Path) -> str:
+def format_decode_error_context(raw_bytes: bytes, error: UnicodeDecodeError) -> str:
+    start = max(error.start - 8, 0)
+    end = min(error.start + 8, len(raw_bytes))
+    snippet = " ".join(f"{byte:02x}" for byte in raw_bytes[start:end])
+    return (
+        f"codec={error.encoding} start={error.start} end={error.end} reason={error.reason}; "
+        f"bytes[{start}:{end}]={snippet}"
+    )
+
+
+def read_text_with_fallbacks(source_path: Path, *, debug_encodings: bool = False) -> TextDecodeResult:
     raw_bytes = source_path.read_bytes()
     last_error: UnicodeDecodeError | None = None
+    error_details: list[str] = []
     for encoding in TEXT_FALLBACK_ENCODINGS:
         try:
-            return raw_bytes.decode(encoding)
+            text = raw_bytes.decode(encoding)
+            if debug_encodings:
+                print(
+                    f"[encoding-debug] {source_path}: decoded with {encoding}",
+                    file=sys.stderr,
+                )
+            return TextDecodeResult(text=text, encoding=encoding)
         except UnicodeDecodeError as exc:
             last_error = exc
+            if debug_encodings:
+                error_details.append(
+                    f"[encoding-debug] {source_path}: {format_decode_error_context(raw_bytes, exc)}"
+                )
 
     assert last_error is not None
+    if debug_encodings:
+        for detail in error_details:
+            print(detail, file=sys.stderr)
     raise last_error
 
 
-def read_csv_rows(source_path: Path) -> list[list[str]]:
-    text = read_text_with_fallbacks(source_path)
+def read_csv_rows(source_path: Path, *, debug_encodings: bool = False) -> list[list[str]]:
+    text = read_text_with_fallbacks(source_path, debug_encodings=debug_encodings).text
     return [row for row in csv.reader(io.StringIO(text, newline=""))]
 
 
@@ -1076,6 +1115,22 @@ def write_pdf_from_html(html_text: str, target_path: Path, base_url: str) -> Non
     HTML(string=html_text, base_url=base_url).write_pdf(str(target_path))
 
 
+def emit_email_conversion_warning(
+    source_path: Path, warning_file: Path | None = None
+) -> None:
+    message = (
+        f"Warning: RecursionError while rendering email HTML for {source_path}; "
+        "using sanitized plaintext fallback."
+    )
+    print(message, file=sys.stderr)
+    if warning_file is None:
+        return
+
+    warning_file.parent.mkdir(parents=True, exist_ok=True)
+    with warning_file.open("a", encoding="utf-8") as handle:
+        handle.write(message + "\n")
+
+
 def convert_file(
     source_path: Path,
     target_path: Path,
@@ -1083,6 +1138,8 @@ def convert_file(
     time_ranges: list[TimeRange],
     my_whatsapp_name: str,
     use_time_ranges_for_non_working_days: bool,
+    debug_encodings: bool,
+    email_conversion_warning_file: Path | None,
 ) -> None:
     suffix = source_path.suffix.lower()
     if suffix == ".eml":
@@ -1096,6 +1153,10 @@ def convert_file(
             )
             return
         except RecursionError:
+            emit_email_conversion_warning(
+                source_path,
+                warning_file=email_conversion_warning_file,
+            )
             fallback_html = build_email_plaintext_fallback_html(source_path)
             write_pdf_from_html(
                 fallback_html,
@@ -1104,7 +1165,8 @@ def convert_file(
             )
             return
     elif suffix == ".txt":
-        text = read_text_with_fallbacks(source_path)
+        decode_result = read_text_with_fallbacks(source_path, debug_encodings=debug_encodings)
+        text = decode_result.text
         entries = parse_chat_entries(text)
         if entries:
             html_text = render_whatsapp_html(
@@ -1116,7 +1178,9 @@ def convert_file(
         else:
             html_text = render_plaintext_fallback_html(source_path.name, text)
     elif suffix == ".csv":
-        html_text = render_csv_html(read_csv_rows(source_path))
+        html_text = render_csv_html(
+            read_csv_rows(source_path, debug_encodings=debug_encodings)
+        )
     else:
         raise ValueError(f"Unsupported file type: {source_path}")
 
@@ -1141,6 +1205,11 @@ def main() -> int:
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    warning_file = (
+        Path(args.email_conversion_warning_file)
+        if args.email_conversion_warning_file
+        else None
+    )
 
     try:
         time_ranges = parse_time_ranges(args.time_ranges)
@@ -1172,6 +1241,8 @@ def main() -> int:
                     time_ranges=time_ranges,
                     my_whatsapp_name=args.my_whatsapp_name,
                     use_time_ranges_for_non_working_days=args.use_time_ranges_for_non_working_days,
+                    debug_encodings=args.debug_encodings,
+                    email_conversion_warning_file=warning_file,
                 )
             except Exception as exc:
                 stats.failed += 1
